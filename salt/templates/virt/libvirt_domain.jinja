@@ -7,6 +7,9 @@
                 {% for dev in boot_dev %}
                 <boot dev='{{ dev }}' />
                 {% endfor %}
+		{% if loader %}
+		<loader readonly='yes' type='pflash'>{{ loader }}</loader>
+		{% endif %}
         </os>
         <devices>
                 {% for diskname, disk in disks.items() %}
@@ -36,7 +39,11 @@
                 {% if enable_vnc %}
                 <graphics type='vnc' listen='0.0.0.0' autoport='yes' />
                 {% endif %}
-                {% if serial_type == 'pty' %}
+		{% if serial_type == 'nmdm' %}
+		<serial type='nmdm'>
+			<source master='/dev/nmdm{{ nmdm_id }}A' slave='/dev/nmdm{{ nmdm_id }}B'/>
+		</serial>
+                {% elif serial_type == 'pty' %}
                 <serial type='pty'>
                         <target port='0'/>
                 </serial>

@@ -8,7 +8,8 @@ Work with virtual machines managed by libvirt
 # of his in the virt func module have been used
 
 # Import python libs
-from __future__ import absolute_import
+from __future__ import absolute_import, print_function, unicode_literals
+import copy
 import os
 import re
 import sys
@@ -21,10 +22,9 @@ import datetime
 from xml.etree import ElementTree
 
 # Import third party libs
-import yaml
 import jinja2
 import jinja2.exceptions
-import salt.ext.six as six
+from salt.ext import six
 from salt.ext.six.moves import StringIO as _StringIO  # pylint: disable=import-error
 from xml.dom import minidom
 try:
@@ -35,10 +35,13 @@ except ImportError:
     HAS_LIBVIRT = False
 
 # Import salt libs
-import salt.utils
 import salt.utils.files
+import salt.utils.network
+import salt.utils.path
+import salt.utils.stringutils
 import salt.utils.templates
 import salt.utils.validate.net
+import salt.utils.yaml
 from salt.exceptions import CommandExecutionError, SaltInvocationError
 
 log = logging.getLogger(__name__)
@@ -142,6 +145,7 @@ def __get_conn():
                                     __esxi_auth(),
                                     0]],
         'qemu': [libvirt.open, [conn_str]],
+        'bhyve': [libvirt.open, ['bhyve:///system']],
     }
 
     hypervisor = __salt__['config.get']('libvirt:hypervisor', 'qemu')
@@ -196,14 +200,14 @@ def _libvirt_creds():
         stdout = subprocess.Popen(g_cmd,
                     shell=True,
                     stdout=subprocess.PIPE).communicate()[0]
-        group = salt.utils.to_str(stdout).split('"')[1]
+        group = salt.utils.stringutils.to_str(stdout).split('"')[1]
     except IndexError:
         group = 'root'
     try:
         stdout = subprocess.Popen(u_cmd,
                     shell=True,
                     stdout=subprocess.PIPE).communicate()[0]
-        user = salt.utils.to_str(stdout).split('"')[1]
+        user = salt.utils.stringutils.to_str(stdout).split('"')[1]
     except IndexError:
         user = 'root'
     return {'user': user, 'group': group}
@@ -241,8 +245,8 @@ def _gen_xml(name,
     context = {
         'hypervisor': hypervisor,
         'name': name,
-        'cpu': str(cpu),
-        'mem': str(mem),
+        'cpu': six.text_type(cpu),
+        'mem': six.text_type(mem),
     }
     if hypervisor in ['qemu', 'kvm']:
         context['controller_model'] = False
@@ -250,10 +254,7 @@ def _gen_xml(name,
         # TODO: make bus and model parameterized, this works for 64-bit Linux
         context['controller_model'] = 'lsilogic'
 
-    if kwargs.get('enable_vnc', True):
-        context['enable_vnc'] = True
-    else:
-        context['enable_vnc'] = False
+    context['enable_vnc'] = kwargs.get('enable_vnc', False)
 
     if 'boot_dev' in kwargs:
         context['boot_dev'] = []
@@ -262,6 +263,8 @@ def _gen_xml(name,
     else:
         context['boot_dev'] = ['hd']
 
+    if 'loader' in kwargs:
+        context['loader'] = kwargs['loader']
     if 'serial_type' in kwargs:
         context['serial_type'] = kwargs['serial_type']
     if 'serial_type' in context and context['serial_type'] == 'tcp':
@@ -270,6 +273,8 @@ def _gen_xml(name,
         else:
             context['telnet_port'] = 23023  # FIXME: use random unused port
     if 'serial_type' in context:
+        if context['serial_type'] == 'nmdm' and 'nmdm_id' in kwargs:
+            context['nmdm_id'] = kwargs['nmdm_id']
         if 'console' in kwargs:
             context['console'] = kwargs['console']
         else:
@@ -279,12 +284,16 @@ def _gen_xml(name,
     for i, disk in enumerate(diskp):
         for disk_name, args in six.iteritems(disk):
             context['disks'][disk_name] = {}
-            fn_ = '{0}.{1}'.format(disk_name, args['format'])
-            context['disks'][disk_name]['file_name'] = fn_
-            context['disks'][disk_name]['source_file'] = os.path.join(args['pool'],
-                                                                      name,
-                                                                      fn_)
-            if hypervisor in ['qemu', 'kvm']:
+            if 'disk_file_path' in args:
+                context['disks'][disk_name]['file_name'] = args['disk_file_path']
+                context['disks'][disk_name]['source_file'] = args['disk_file_path']
+            else:
+                fn_ = '{0}.{1}'.format(disk_name, args['format'])
+                context['disks'][disk_name]['file_name'] = fn_
+                context['disks'][disk_name]['source_file'] = os.path.join(args['pool'],
+                                                                          name,
+                                                                          fn_)
+            if hypervisor in ['qemu', 'kvm', 'bhyve']:
                 context['disks'][disk_name]['target_dev'] = 'vd{0}'.format(string.ascii_lowercase[i])
                 context['disks'][disk_name]['address'] = False
                 context['disks'][disk_name]['driver'] = True
@@ -294,7 +303,7 @@ def _gen_xml(name,
                 context['disks'][disk_name]['driver'] = False
             context['disks'][disk_name]['disk_bus'] = args['model']
             context['disks'][disk_name]['type'] = args['format']
-            context['disks'][disk_name]['index'] = str(i)
+            context['disks'][disk_name]['index'] = six.text_type(i)
 
     context['nics'] = nicp
 
@@ -302,7 +311,7 @@ def _gen_xml(name,
     try:
         template = JINJA.get_template(fn_)
     except jinja2.exceptions.TemplateNotFound:
-        log.error('Could not load template {0}'.format(fn_))
+        log.error('Could not load template %s', fn_)
         return ''
 
     return template.render(**context)
@@ -323,14 +332,14 @@ def _gen_vol_xml(vmname,
         'filename': '{0}.{1}'.format(diskname, disk_info['disktype']),
         'volname': diskname,
         'disktype': disk_info['disktype'],
-        'size': str(size),
+        'size': six.text_type(size),
         'pool': disk_info['pool'],
     }
     fn_ = 'libvirt_volume.jinja'
     try:
         template = JINJA.get_template(fn_)
     except jinja2.exceptions.TemplateNotFound:
-        log.error('Could not load template {0}'.format(fn_))
+        log.error('Could not load template %s', fn_)
         return ''
     return template.render(**context)
 
@@ -351,6 +360,204 @@ def _qemu_image_info(path):
         except AttributeError:
             continue
     return ret
+
+
+def _zfs_image_create(vm_name,
+                      disk_filesystem_name,
+                      disk_name,
+                      hostname_property_name,
+                      sparse_volume,
+                      disk_size,
+                      disk_image_name):
+    '''
+    Clones an existing image, or creates a new one.
+
+    When cloning an image, disk_image_name refers to the source
+    of the clone. If not specified, disk_size is used for creating
+    a new zvol, and sparse_volume determines whether to create
+    a thin provisioned volume.
+
+    Set the disk_filesystem_name to the ZFS filesystem in which to
+    create the new zvol.
+
+    The cloned or new volume can have a ZFS property set containing
+    the vm_name. Use hostname_property_name for specifying the key
+    of this ZFS property.
+
+    Example profile for a bhyve VM with two ZFS disks. The first is
+    cloned from the specified image. The second disk is a thin
+    provisioned volume.
+
+    .. code-block:: yaml
+
+        virt:
+          disk:
+            two_zvols:
+              - system:
+                  image: zroot/bhyve/CentOS-7-x86_64-v1@v1.0.5
+                  hostname_property: virt:hostname
+                  disk_filesystem: zroot/bhyve/guests
+              - data:
+                  disk_filesystem: tank/disks
+                  size: 20G
+                  hostname_property: virt:hostname
+                  sparse_volume: True
+    '''
+    if not disk_image_name and not disk_size:
+        raise CommandExecutionError(
+            'Unable to create new disk {0}, please specify'
+            ' the disk image name or disk size argument'
+            .format(disk_name)
+        )
+
+    if not disk_filesystem_name:
+        raise CommandExecutionError(
+            'Unable to create new disk {0}, please specify'
+            ' the disk filesystem name'.format(disk_name))
+
+    destination_fs = os.path.join(disk_filesystem_name,
+                                  '{0}.{1}'.format(vm_name, disk_name))
+    log.debug('Image destination will be %s', destination_fs)
+
+    existing_disk = __salt__['zfs.list'](name=disk_filesystem_name)
+    if 'error' in existing_disk:
+        raise CommandExecutionError(
+            'Unable to create new disk {0}. {1}'
+            .format(destination_fs, existing_disk['error'])
+        )
+    elif destination_fs in existing_disk:
+        log.info('ZFS filesystem {0} already exists. Skipping creation'
+                 .format(destination_fs))
+        blockdevice_path = os.path.join('/dev/zvol', disk_filesystem_name, vm_name)
+        return blockdevice_path
+
+    properties = {}
+    if hostname_property_name:
+        properties[hostname_property_name] = vm_name
+
+    if disk_image_name:
+        __salt__['zfs.clone'](
+                  name_a=disk_image_name,
+                  name_b=destination_fs,
+                  properties=properties)
+
+    elif disk_size:
+        __salt__['zfs.create'](
+                name=destination_fs,
+                properties=properties,
+                volume_size=disk_size,
+                sparse=sparse_volume)
+
+    blockdevice_path = os.path.join('/dev/zvol', disk_filesystem_name, '{0}.{1}'
+                                    .format(vm_name, disk_name))
+    log.debug('Image path will be %s', blockdevice_path)
+    return blockdevice_path
+
+
+def _qemu_image_create(vm_name,
+                       disk_file_name,
+                       disk_image=None,
+                       disk_size=None,
+                       disk_type='qcow2',
+                       enable_qcow=False,
+                       saltenv='base'):
+    '''
+    Create the image file using specified disk_size or/and disk_image
+
+    Return path to the created image file
+    '''
+    if not disk_size and not disk_image:
+        raise CommandExecutionError(
+            'Unable to create new disk {0}, please specify'
+            ' disk size and/or disk image argument'
+            .format(disk_file_name)
+        )
+
+    img_dir = __salt__['config.option']('virt.images')
+    log.debug('Image directory from config option `virt.images`'
+              ' is %s', img_dir)
+    img_dest = os.path.join(
+        img_dir,
+        vm_name,
+        disk_file_name
+    )
+    log.debug('Image destination will be %s', img_dest)
+    img_dir = os.path.dirname(img_dest)
+    log.debug('Image destination directory is %s', img_dir)
+    try:
+        os.makedirs(img_dir)
+    except OSError:
+        pass
+
+    if disk_image:
+        log.debug('Create disk from specified image %s', disk_image)
+        sfn = __salt__['cp.cache_file'](disk_image, saltenv)
+
+        qcow2 = False
+        if salt.utils.path.which('qemu-img'):
+            res = __salt__['cmd.run']('qemu-img info {}'.format(sfn))
+            imageinfo = salt.utils.yaml.safe_load(res)
+            qcow2 = imageinfo['file format'] == 'qcow2'
+        try:
+            if enable_qcow and qcow2:
+                log.info('Cloning qcow2 image %s using copy on write', sfn)
+                __salt__['cmd.run'](
+                    'qemu-img create -f qcow2 -o backing_file={0} {1}'
+                    .format(sfn, img_dest).split())
+            else:
+                log.debug('Copying %s to %s', sfn, img_dest)
+                salt.utils.files.copyfile(sfn, img_dest)
+
+            mask = os.umask(0)
+            os.umask(mask)
+
+            if disk_size and qcow2:
+                log.debug('Resize qcow2 image to %sM', disk_size)
+                __salt__['cmd.run'](
+                    'qemu-img resize {0} {1}M'
+                    .format(img_dest, disk_size)
+                )
+
+            log.debug('Apply umask and remove exec bit')
+            mode = (0o0777 ^ mask) & 0o0666
+            os.chmod(img_dest, mode)
+
+        except (IOError, OSError) as e:
+            raise CommandExecutionError(
+                'Problem while copying image. {0} - {1}'
+                .format(disk_image, e)
+            )
+
+    else:
+        # Create empty disk
+        try:
+            mask = os.umask(0)
+            os.umask(mask)
+
+            if disk_size:
+                log.debug('Create empty image with size %sM', disk_size)
+                __salt__['cmd.run'](
+                    'qemu-img create -f {0} {1} {2}M'
+                    .format(disk_type, img_dest, disk_size)
+                )
+            else:
+                raise CommandExecutionError(
+                    'Unable to create new disk {0},'
+                    ' please specify <size> argument'
+                    .format(img_dest)
+                )
+
+            log.debug('Apply umask and remove exec bit')
+            mode = (0o0777 ^ mask) & 0o0666
+            os.chmod(img_dest, mode)
+
+        except (IOError, OSError) as e:
+            raise CommandExecutionError(
+                'Problem while creating volume {0} - {1}'
+                .format(img_dest, e)
+            )
+
+    return img_dest
 
 
 # TODO: this function is deprecated, should be replaced with
@@ -403,6 +610,24 @@ def _disk_profile(profile, hypervisor, **kwargs):
                   format: qcow2
                   model: virtio
 
+    Example profile for KVM/QEMU with two disks, first is created
+    from specified image, the second is empty:
+
+    .. code-block:: yaml
+
+        virt:
+          disk:
+            two_disks:
+              - system:
+                  size: 8192
+                  format: qcow2
+                  model: virtio
+                  image: http://path/to/image.qcow2
+              - lvm:
+                  size: 32768
+                  format: qcow2
+                  model: virtio
+
     The ``format`` and ``model`` parameters are optional, and will
     default to whatever is best suitable for the active hypervisor.
     '''
@@ -414,17 +639,20 @@ def _disk_profile(profile, hypervisor, **kwargs):
     if hypervisor in ['esxi', 'vmware']:
         overlay = {'format': 'vmdk',
                    'model': 'scsi',
-                   'pool': '[{0}] '.format(kwargs.get('pool', '0'))
-                  }
+                   'pool': '[{0}] '.format(kwargs.get('pool', '0'))}
     elif hypervisor in ['qemu', 'kvm']:
         overlay = {'format': 'qcow2',
                    'model': 'virtio',
-                   'pool': __salt__['config.option']('virt.images')
-                  }
+                   'pool': __salt__['config.option']('virt.images')}
+    elif hypervisor in ['bhyve']:
+        overlay = {'format': 'raw',
+                   'model': 'virtio',
+                   'pool': __salt__['config.option']('virt.images')}
     else:
         overlay = {}
 
-    disklist = __salt__['config.get']('virt:disk', {}).get(profile, default)
+    disklist = copy.deepcopy(
+        __salt__['config.get']('virt:disk', {}).get(profile, default))
     for key, val in six.iteritems(overlay):
         for i, disks in enumerate(disklist):
             for disk in disks:
@@ -438,11 +666,13 @@ def _nic_profile(profile_name, hypervisor, **kwargs):
     default = [{'eth0': {}}]
     vmware_overlay = {'type': 'bridge', 'source': 'DEFAULT', 'model': 'e1000'}
     kvm_overlay = {'type': 'bridge', 'source': 'br0', 'model': 'virtio'}
+    bhyve_overlay = {'type': 'bridge', 'source': 'bridge0', 'model': 'virtio'}
     overlays = {
             'kvm': kvm_overlay,
             'qemu': kvm_overlay,
             'esxi': vmware_overlay,
             'vmware': vmware_overlay,
+            'bhyve': bhyve_overlay,
             }
 
     # support old location
@@ -525,21 +755,25 @@ def _nic_profile(profile_name, hypervisor, **kwargs):
             if key not in attributes or not attributes[key]:
                 attributes[key] = value
 
-    def _assign_mac(attributes):
+    def _assign_mac(attributes, hypervisor):
         dmac = kwargs.get('dmac', None)
         if dmac is not None:
-            log.debug('DMAC address is {0}'.format(dmac))
+            log.debug('DMAC address is %s', dmac)
             if salt.utils.validate.net.mac(dmac):
                 attributes['mac'] = dmac
             else:
                 msg = 'Malformed MAC address: {0}'.format(dmac)
                 raise CommandExecutionError(msg)
         else:
-            attributes['mac'] = salt.utils.gen_mac()
+            if hypervisor in ['qemu', 'kvm']:
+                attributes['mac'] = salt.utils.gen_mac(
+                    prefix='52:54:00')
+            else:
+                attributes['mac'] = salt.utils.gen_mac()
 
     for interface in interfaces:
         _normalize_net_types(interface)
-        _assign_mac(interface)
+        _assign_mac(interface, hypervisor)
         if hypervisor in overlays:
             _apply_default_overlay(interface)
 
@@ -575,95 +809,37 @@ def init(name,
         salt 'hypervisor' virt.init vm_name 4 512 nic=profile disk=profile
     '''
     hypervisor = __salt__['config.get']('libvirt:hypervisor', hypervisor)
-    log.debug('Using hyperisor {0}'.format(hypervisor))
+    log.debug('Using hyperisor %s', hypervisor)
 
     nicp = _nic_profile(nic, hypervisor, **kwargs)
-    log.debug('NIC profile is {0}'.format(nicp))
+    log.debug('NIC profile is %s', nicp)
 
-    diskp = None
-    seedable = False
-    if image:  # with disk template image
-        log.debug('Image {0} will be used'.format(image))
-        # if image was used, assume only one disk, i.e. the
-        # 'default' disk profile
-        # TODO: make it possible to use disk profiles and use the
-        # template image as the system disk
-        diskp = _disk_profile('default', hypervisor, **kwargs)
-        log.debug('Disk profile is {0}'.format(diskp))
+    diskp = _disk_profile(disk, hypervisor, **kwargs)
 
-        # When using a disk profile extract the sole dict key of the first
-        # array element as the filename for disk
+    if image:
+        # If image is specified in module arguments, then it will be used
+        # for the first disk instead of the image from the disk profile
         disk_name = next(six.iterkeys(diskp[0]))
-        disk_type = diskp[0][disk_name]['format']
-        disk_file_name = '{0}.{1}'.format(disk_name, disk_type)
+        log.debug('%s image from module arguments will be used for disk "%s"'
+                  ' instead of %s', image, disk_name, diskp[0][disk_name].get('image'))
+        diskp[0][disk_name]['image'] = image
 
-        if hypervisor in ['esxi', 'vmware']:
-            # TODO: we should be copying the image file onto the ESX host
-            raise SaltInvocationError(
-                'virt.init does not support image template template in '
-                'conjunction with esxi hypervisor'
-            )
-        elif hypervisor in ['qemu', 'kvm']:
-            img_dir = __salt__['config.option']('virt.images')
-            log.debug('Image directory from config option `virt.images` is {0}'
-                      .format(img_dir))
-            img_dest = os.path.join(
-                img_dir,
-                name,
-                disk_file_name
-            )
-            log.debug('Image destination will be {0}'.format(img_dest))
-            img_dir = os.path.dirname(img_dest)
-            log.debug('Image destination directory is  {0}'.format(img_dir))
-            sfn = __salt__['cp.cache_file'](image, saltenv)
+    # Create multiple disks, empty or from specified images.
+    for disk in diskp:
+        log.debug("Creating disk for VM [ %s ]: %s", name, disk)
 
-            try:
-                os.makedirs(img_dir)
-            except OSError:
-                pass
+        for disk_name, args in six.iteritems(disk):
 
-            qcow2 = False
-            if salt.utils.which('qemu-img'):
-                res = __salt__['cmd.run']('qemu-img info {}'.format(sfn))
-                imageinfo = yaml.load(res)
-                qcow2 = imageinfo['file format'] == 'qcow2'
-
-            try:
-                if enable_qcow and qcow2:
-                    log.info('Cloning qcow2 image {} using copy on write'
-                              .format(sfn))
-                    __salt__['cmd.run'](
-                        'qemu-img create -f qcow2 -o backing_file={} {}'
-                        .format(sfn, img_dest).split())
+            if hypervisor in ['esxi', 'vmware']:
+                if 'image' in args:
+                    # TODO: we should be copying the image file onto the ESX host
+                    raise SaltInvocationError(
+                        'virt.init does not support image '
+                        'template in conjunction with esxi hypervisor'
+                    )
                 else:
-                    log.debug('Copying {0} to {1}'.format(sfn, img_dest))
-                    salt.utils.files.copyfile(sfn, img_dest)
-                mask = salt.utils.files.get_umask()
-                # Apply umask and remove exec bit
-                mode = (0o0777 ^ mask) & 0o0666
-                os.chmod(img_dest, mode)
-            except (IOError, OSError) as e:
-                raise CommandExecutionError('problem copying image. {0} - {1}'.format(image, e))
-
-            seedable = True
-        else:
-            log.error('Unsupported hypervisor when handling disk image')
-    else:
-        # no disk template image specified, create disks based on disk profile
-        diskp = _disk_profile(disk, hypervisor, **kwargs)
-        log.debug('No image specified, disk profile will be used: {0}'.format(diskp))
-        if hypervisor in ['qemu', 'kvm']:
-            # TODO: we should be creating disks in the local filesystem with
-            # qemu-img
-            raise SaltInvocationError(
-                'virt.init does not support disk profiles in conjunction with '
-                'qemu/kvm at this time, use image template instead'
-            )
-        else:
-            # assume libvirt manages disks for us
-            for disk in diskp:
-                for disk_name, args in six.iteritems(disk):
-                    log.debug('Generating libvirt XML for {0}'.format(disk))
+                    # assume libvirt manages disks for us
+                    log.debug('Generating libvirt XML for %s', disk)
                     xml = _gen_vol_xml(
                         name,
                         disk_name,
@@ -672,6 +848,60 @@ def init(name,
                     )
                     define_vol_xml_str(xml)
 
+            elif hypervisor in ['qemu', 'kvm']:
+
+                disk_type = args.get('format', 'qcow2')
+                disk_image = args.get('image', None)
+                disk_size = args.get('size', None)
+                disk_file_name = '{0}.{1}'.format(disk_name, disk_type)
+
+                img_dest = _qemu_image_create(
+                    vm_name=name,
+                    disk_file_name=disk_file_name,
+                    disk_image=disk_image,
+                    disk_size=disk_size,
+                    disk_type=disk_type,
+                    enable_qcow=enable_qcow,
+                    saltenv=saltenv,
+                )
+
+                # Seed only if there is an image specified
+                if seed and disk_image:
+                    log.debug('Seed command is %s', seed_cmd)
+                    __salt__[seed_cmd](
+                        img_dest,
+                        id_=name,
+                        config=kwargs.get('config'),
+                        install=install,
+                        pub_key=pub_key,
+                        priv_key=priv_key,
+                    )
+            elif hypervisor in ['bhyve']:
+                disk_type = args.get('format', 'raw')
+                disk_image = args.get('image', None)
+                disk_filesystem = args.get('disk_filesystem')
+                disk_size = args.get('size', None)
+                sparse_volume = args.get('sparse_volume', False)
+                hostname_property_name = args.get('hostname_property')
+
+                img_dest = _zfs_image_create(
+                    vm_name = name,
+                    disk_filesystem_name=disk_filesystem,
+                    disk_name=disk_name,
+                    disk_size=disk_size,
+                    disk_image_name=disk_image,
+                    hostname_property_name=hostname_property_name,
+                    sparse_volume=sparse_volume,
+                )
+                args['disk_file_path'] = img_dest
+
+            else:
+                # Unknown hypervisor
+                raise SaltInvocationError(
+                    'Unsupported hypervisor when handling disk image: {0}'
+                    .format(hypervisor)
+                )
+
     log.debug('Generating VM XML')
     kwargs['enable_vnc'] = enable_vnc
     xml = _gen_xml(name, cpu, mem, diskp, nicp, hypervisor, **kwargs)
@@ -679,24 +909,14 @@ def init(name,
         define_xml_str(xml)
     except libvirtError as err:
         # check if failure is due to this domain already existing
-        if "domain '{}' already exists".format(name) in str(err):
+        if "domain '{}' already exists".format(name) in six.text_type(err):
             # continue on to seeding
             log.warning(err)
         else:
             raise err  # a real error we should report upwards
 
-    if seed and seedable:
-        log.debug('Seed command is {0}'.format(seed_cmd))
-        __salt__[seed_cmd](
-           img_dest,
-           id_=name,
-           config=kwargs.get('config'),
-           install=install,
-           pub_key=pub_key,
-           priv_key=priv_key,
-        )
     if start:
-        log.debug('Creating {0}'.format(name))
+        log.debug('Starting VM %s', name)
         _get_domain(name).create()
 
     return True
@@ -841,7 +1061,7 @@ def node_info():
     raw = conn.getInfo()
     info = {'cpucores': raw[6],
             'cpumhz': raw[3],
-            'cpumodel': str(raw[0]),
+            'cpumodel': six.text_type(raw[0]),
             'cpus': raw[2],
             'cputhreads': raw[7],
             'numanodes': raw[4],
@@ -879,7 +1099,7 @@ def get_nics(vm_):
                     temp = {}
                     for key, value in v_node.attributes.items():
                         temp[key] = value
-                    nic[str(v_node.tagName)] = temp
+                    nic[six.text_type(v_node.tagName)] = temp
                 # virtualport needs to be handled separately, to pick up the
                 # type attribute of the virtualport itself
                 if v_node.tagName == 'virtualport':
@@ -951,6 +1171,7 @@ def get_disks(vm_):
         salt '*' virt.get_disks <domain>
     '''
     disks = {}
+    hypervisor = __salt__['config.get']('libvirt:hypervisor', 'kvm')
     doc = minidom.parse(_StringIO(get_xml(vm_)))
     for elem in doc.getElementsByTagName('disk'):
         sources = elem.getElementsByTagName('source')
@@ -966,6 +1187,11 @@ def get_disks(vm_):
         if target.hasAttribute('dev'):
             qemu_target = ''
             if source.hasAttribute('file'):
+                if source.getAttribute('file').startswith('/dev/zvol/') and  hypervisor == 'bhyve':
+                    disks[target.getAttribute('dev')] = {
+                            'file': source.getAttribute('file'),
+                            'zfs': True}
+                    continue
                 qemu_target = source.getAttribute('file')
             elif source.hasAttribute('dev'):
                 qemu_target = source.getAttribute('dev')
@@ -979,7 +1205,6 @@ def get_disks(vm_):
                     'file': qemu_target}
     for dev in disks:
         try:
-            hypervisor = __salt__['config.get']('libvirt:hypervisor', 'kvm')
             if hypervisor not in ['qemu', 'kvm']:
                 break
 
@@ -988,7 +1213,7 @@ def get_disks(vm_):
                         ['qemu-img', 'info', disks[dev]['file']],
                         shell=False,
                         stdout=subprocess.PIPE).communicate()[0]
-            qemu_output = salt.utils.to_str(stdout)
+            qemu_output = salt.utils.stringutils.to_str(stdout)
             snapshots = False
             columns = None
             lines = qemu_output.strip().split('\n')
@@ -1028,9 +1253,9 @@ def get_disks(vm_):
                     continue
                 output.append(line)
             output = '\n'.join(output)
-            disks[dev].update(yaml.safe_load(output))
+            disks[dev].update(salt.utils.yaml.safe_load(output))
         except TypeError:
-            disks[dev].update(yaml.safe_load('image: Does not exist'))
+            disks[dev].update({'image': 'Does not exist'})
     return disks
 
 
@@ -1341,8 +1566,10 @@ def create_xml_path(path):
         salt '*' virt.create_xml_path <path to XML file on the node>
     '''
     try:
-        with salt.utils.fopen(path, 'r') as fp_:
-            return create_xml_str(fp_.read())
+        with salt.utils.files.fopen(path, 'r') as fp_:
+            return create_xml_str(
+                salt.utils.stringutils.to_unicode(fp_.read())
+            )
     except (OSError, IOError):
         return False
 
@@ -1373,8 +1600,10 @@ def define_xml_path(path):
 
     '''
     try:
-        with salt.utils.fopen(path, 'r') as fp_:
-            return define_xml_str(fp_.read())
+        with salt.utils.files.fopen(path, 'r') as fp_:
+            return define_xml_str(
+                salt.utils.stringutils.to_unicode(fp_.read())
+            )
     except (OSError, IOError):
         return False
 
@@ -1391,7 +1620,7 @@ def define_vol_xml_str(xml):
     '''
     poolname = __salt__['config.get']('libvirt:storagepool', 'default')
     conn = __get_conn()
-    pool = conn.storagePoolLookupByName(str(poolname))
+    pool = conn.storagePoolLookupByName(six.text_type(poolname))
     return pool.createXML(xml, 0) is not None
 
 
@@ -1407,8 +1636,10 @@ def define_vol_xml_path(path):
 
     '''
     try:
-        with salt.utils.fopen(path, 'r') as fp_:
-            return define_vol_xml_str(fp_.read())
+        with salt.utils.files.fopen(path, 'r') as fp_:
+            return define_vol_xml_str(
+                salt.utils.stringutils.to_unicode(fp_.read())
+            )
     except (OSError, IOError):
         return False
 
@@ -1429,7 +1660,7 @@ def migrate_non_shared(vm_, target, ssh=False):
     stdout = subprocess.Popen(cmd,
                 shell=True,
                 stdout=subprocess.PIPE).communicate()[0]
-    return salt.utils.to_str(stdout)
+    return salt.utils.stringutils.to_str(stdout)
 
 
 def migrate_non_shared_inc(vm_, target, ssh=False):
@@ -1448,7 +1679,7 @@ def migrate_non_shared_inc(vm_, target, ssh=False):
     stdout = subprocess.Popen(cmd,
                 shell=True,
                 stdout=subprocess.PIPE).communicate()[0]
-    return salt.utils.to_str(stdout)
+    return salt.utils.stringutils.to_str(stdout)
 
 
 def migrate(vm_, target, ssh=False):
@@ -1467,7 +1698,7 @@ def migrate(vm_, target, ssh=False):
     stdout = subprocess.Popen(cmd,
                 shell=True,
                 stdout=subprocess.PIPE).communicate()[0]
-    return salt.utils.to_str(stdout)
+    return salt.utils.stringutils.to_str(stdout)
 
 
 def seed_non_shared_migrate(disks, force=False):
@@ -1488,7 +1719,7 @@ def seed_non_shared_migrate(disks, force=False):
         size = data['virtual size'].split()[1][1:]
         if os.path.isfile(fn_) and not force:
             # the target exists, check to see if it is compatible
-            pre = yaml.safe_load(subprocess.Popen('qemu-img info arch',
+            pre = salt.utils.yaml.safe_load(subprocess.Popen('qemu-img info arch',
                 shell=True,
                 stdout=subprocess.PIPE).communicate()[0])
             if pre['file format'] != data['file format']\
@@ -1567,8 +1798,17 @@ def purge(vm_, dirs=False):
         pass
     directories = set()
     for disk in disks:
-        os.remove(disks[disk]['file'])
-        directories.add(os.path.dirname(disks[disk]['file']))
+        if disks[disk].get('zfs', False):
+            # Sleep a little while to avoid 'dataset is busy'
+            time.sleep(2)
+            fs_name = disks[disk]['file'][len('/dev/zvol/'):]
+            log.info('Destroying VM ZFS volume {0}'.format(fs_name))
+            __salt__['zfs.destroy'](
+                    name=fs_name,
+                    force=True)
+        else:
+            os.remove(disks[disk]['file'])
+            directories.add(os.path.dirname(disks[disk]['file']))
     if dirs:
         for dir_ in directories:
             shutil.rmtree(dir_)
@@ -1600,8 +1840,8 @@ def is_kvm_hyper():
         salt '*' virt.is_kvm_hyper
     '''
     try:
-        with salt.utils.fopen('/proc/modules') as fp_:
-            if 'kvm_' not in fp_.read():
+        with salt.utils.files.fopen('/proc/modules') as fp_:
+            if 'kvm_' not in salt.utils.stringutils.to_unicode(fp_.read()):
                 return False
     except IOError:
         # No /proc/modules? Are we on Windows? Or Solaris?
@@ -1626,13 +1866,26 @@ def is_xen_hyper():
         # virtual_subtype isn't set everywhere.
         return False
     try:
-        with salt.utils.fopen('/proc/modules') as fp_:
-            if 'xen_' not in fp_.read():
+        with salt.utils.files.fopen('/proc/modules') as fp_:
+            if 'xen_' not in salt.utils.stringutils.to_unicode(fp_.read()):
                 return False
     except (OSError, IOError):
         # No /proc/modules? Are we on Windows? Or Solaris?
         return False
     return 'libvirtd' in __salt__['cmd.run'](__grains__['ps'])
+
+
+def is_bhyve_hyper():
+    sysctl_cmd = 'sysctl hw.vmm.create'
+    vmm_enabled = False
+    try:
+        stdout = subprocess.Popen(sysctl_cmd,
+                                  shell=True,
+                                  stdout=subprocess.PIPE).communicate()[0]
+        vmm_enabled = len(salt.utils.stringutils.to_str(stdout).split('"')[1]) != 0
+    except IndexError:
+        pass
+    return vmm_enabled
 
 
 def is_hyper():
@@ -1646,7 +1899,7 @@ def is_hyper():
         salt '*' virt.is_hyper
     '''
     if HAS_LIBVIRT:
-        return is_xen_hyper() or is_kvm_hyper()
+        return is_xen_hyper() or is_kvm_hyper() or is_bhyve_hyper()
     return False
 
 
@@ -2039,7 +2292,7 @@ def cpu_baseline(full=False, migratable=False, out='libvirt'):
 
     cpu = caps.getElementsByTagName('host')[0].getElementsByTagName('cpu')[0]
 
-    log.debug('Host CPU model definition: {0}'.format(cpu.toxml()))
+    log.debug('Host CPU model definition: %s', cpu.toxml())
 
     flags = 0
     if migratable:
@@ -2060,7 +2313,7 @@ def cpu_baseline(full=False, migratable=False, out='libvirt'):
     if full and not getattr(libvirt, 'VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES', False):
         # Try do it by ourselves
         # Find the models in cpu_map.xml and iterate over them for as long as entries have submodels
-        with salt.utils.fopen('/usr/share/libvirt/cpu_map.xml', 'r') as cpu_map:
+        with salt.utils.files.fopen('/usr/share/libvirt/cpu_map.xml', 'r') as cpu_map:
             cpu_map = minidom.parse(cpu_map)
 
         cpu_model = cpu.getElementsByTagName('model')[0].childNodes[0].nodeValue
